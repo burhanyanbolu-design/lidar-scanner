@@ -1,0 +1,9 @@
+opencv-python
+pyserial
+flask
+flask-socketio
+numpy
+Pillow
+ultralytics
+qrcode[pil]
+pyopenssl
