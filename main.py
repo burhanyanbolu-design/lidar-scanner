@@ -13,10 +13,11 @@ from datetime import datetime
 from flask import Flask, render_template_string, jsonify, Response, request
 from flask_socketio import SocketIO
 from scanner.topdown import TopDownMap
-from scanner.detector import (
+from scanner.detector_rfdetr import (
     detect_all_frames, load_detections, load_custom_labels,
     save_custom_label, search_object, get_all_object_names,
-    draw_detections, FRAMES_DIR as DET_FRAMES_DIR,
+    draw_detections, detect_frame_live,
+    FRAMES_DIR as DET_FRAMES_DIR,
     OUTPUT_DIR, LABELS_DIR
 )
 
@@ -901,7 +902,9 @@ def clear_frames():
     files = glob.glob(os.path.join(FRAMES_DIR, "frame_*.jpg"))
     for f in files:
         os.remove(f)
-    state["frame_count"] = 0
+    state["frame_count"]     = 0
+    state["live_boxes"]      = []
+    state["annotated_frame"] = None
     mapper.__init__()  # reset map
 
     # Wipe detection and label files
@@ -912,6 +915,13 @@ def clear_frames():
         if os.path.exists(path):
             with open(path, "w") as f:
                 json.dump({}, f)
+
+    # Reload matcher so it forgets old templates
+    try:
+        from scanner.matcher import reload_templates
+        reload_templates()
+    except Exception:
+        pass
 
     socketio.emit('cleared', {"msg": f"Deleted {len(files)} frames and all labels"})
     return jsonify({"status": "cleared", "deleted": len(files)})
@@ -1679,9 +1689,9 @@ def run_dashboard():
 
 
 def run_live_detector():
-    """Background thread: runs YOLO + visual matcher on live frames."""
-    from scanner.detector import _get_model
-    from scanner.matcher  import match_frame, reload_templates
+    """Background thread: runs RF-DETR (or YOLOv8 fallback) + visual matcher on live frames."""
+    from scanner.detector_rfdetr import detect_frame_live
+    from scanner.matcher         import match_frame, reload_templates
     DETECT_INTERVAL = 0.4
     reload_templates()  # load saved labeled crops on startup
 
@@ -1696,28 +1706,23 @@ def run_live_detector():
 
         boxes = []
 
-        # ── 1. YOLO detections (80 standard objects) ──
-        model = _get_model()
-        if model is not None:
-            known = set(n.lower() for n in get_all_object_names())
-            try:
-                results = model(frame, verbose=False)[0]
-                for box in results.boxes:
-                    cls_id = int(box.cls[0])
-                    label  = model.names[cls_id]
-                    conf   = float(box.conf[0])
-                    if conf < 0.35:
-                        continue
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    boxes.append({
-                        "label":      label,
-                        "confidence": round(conf, 2),
-                        "box":        [x1, y1, x2, y2],
-                        "known":      label.lower() in known,
-                        "source":     "yolo"
-                    })
-            except Exception as e:
-                print(f"YOLO error: {e}")
+        # ── 1. RF-DETR detections — only show objects you have custom labels for ──
+        known = set(n.lower() for n in get_all_object_names())
+        try:
+            rfdetr_boxes = detect_frame_live(
+                frame,
+                whitelist=known if known else None
+            )
+            for det in rfdetr_boxes:
+                boxes.append({
+                    "label":      det["label"],
+                    "confidence": det["confidence"],
+                    "box":        det["box"],
+                    "known":      True,
+                    "source":     "rf-detr"
+                })
+        except Exception as e:
+            print(f"RF-DETR live error: {e}")
 
         # ── 2. Visual matcher (your custom labeled objects) ──
         try:
@@ -1730,17 +1735,39 @@ def run_live_detector():
 
         # Draw boxes onto a copy of the frame and store as annotated_frame
         annotated = frame.copy()
+        h, w = annotated.shape[:2]
+        # Scale font/thickness based on image size (iPhone 14 Pro is very high res)
+        scale     = max(0.6, min(w, h) / 1000.0)
+        thickness = max(2, int(scale * 2))
+        font_scale = scale * 0.7
+        label_h   = max(28, int(36 * scale))
+
+        used_label_rects = []  # track label positions to avoid overlap
+
         for det in boxes:
             x1, y1, x2, y2 = det["box"]
             label = det["label"]
             conf  = det["confidence"]
             color = (0, 255, 80) if det.get("known") else (0, 200, 255)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+
             txt = f"{label} {int(conf*100)}%"
-            tw  = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0][0]
-            cv2.rectangle(annotated, (x1, max(0, y1-24)), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(annotated, txt, (x1 + 3, max(12, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+
+            # Try placing label above box, shift down if it overlaps another label
+            lx1, ly1 = x1, max(0, y1 - label_h)
+            lx2, ly2 = x1 + tw + 8, ly1 + label_h
+            # If overlapping a previous label, place inside box top instead
+            for (rx1, ry1, rx2, ry2) in used_label_rects:
+                if lx1 < rx2 and lx2 > rx1 and ly1 < ry2 and ly2 > ry1:
+                    ly1 = y1 + 2
+                    ly2 = ly1 + label_h
+                    break
+            used_label_rects.append((lx1, ly1, lx2, ly2))
+
+            cv2.rectangle(annotated, (lx1, ly1), (lx2, ly2), color, -1)
+            cv2.putText(annotated, txt, (lx1 + 4, ly2 - int(label_h * 0.25)),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
         state["annotated_frame"] = annotated
 
         if boxes:
