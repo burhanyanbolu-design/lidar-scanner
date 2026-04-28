@@ -1,6 +1,7 @@
 @echo off
 echo ================================
 echo  LiDAR Scanner Setup
+echo  With RF-DETR Object Detection
 echo ================================
 echo.
 
@@ -10,7 +11,7 @@ python -m venv venv
 echo Activating virtual environment...
 call venv\Scripts\activate
 
-echo Installing dependencies...
+echo Installing all dependencies...
 pip install -r requirements.txt
 
 echo.
